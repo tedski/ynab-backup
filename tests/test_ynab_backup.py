@@ -7,7 +7,7 @@ import json
 import pytest
 
 from ynab_backup import backup, restore
-from ynab_backup.client import SlidingWindowRateLimiter
+from ynab_backup.client import SlidingWindowRateLimiter, YnabClient
 from ynab_backup.constants import TXN_BATCH_SIZE
 from ynab_backup.exceptions import YnabError
 
@@ -137,7 +137,7 @@ def test_prune_snapshots(tmp_path, n_seeds, retention, expected):
 @pytest.mark.parametrize(
     (
         "budgets",
-        "escenario",
+        "scenario",
         "budget_id",
         "budget_name",
         "expected_id",
@@ -176,7 +176,7 @@ def test_prune_snapshots(tmp_path, n_seeds, retention, expected):
     ],
 )
 def test_resolve_budget(
-    budgets, escenario, budget_id, budget_name, expected_id, expected_name, expect_error
+    budgets, scenario, budget_id, budget_name, expected_id, expected_name, expect_error
 ):
     client = FakeClient(
         budgets=budgets,
@@ -704,6 +704,248 @@ def test_rate_limiter_report_429():
     # The penalty timestamp is at now - 3600 + 120 = 1000 - 3600 + 120 = -2480
     # It will age out in 120 seconds (at time 1120)
     clock[0] = 1120.0
-    limiter.acquire()  # Prunes: original t=1000 aged out (1120-3600=-2480<1000).
-    # The penalty timestamp (-2480 + delay) also aged out since clock > 1120.
+    limiter.acquire()  # penalty (t=-2480) ages out, original (t=1000) stays, append → 2.
+    # The penalty timestamp (-2480) is not > -2480, so it's pruned.
     assert len(limiter._timestamps) <= 2
+
+
+# --------------------------------------------------------------------------- #
+# YnabClient retry / backoff tests
+# --------------------------------------------------------------------------- #
+
+
+class FakeResponse:
+    def __init__(self, status_code, json_data=None, headers=None, text=""):
+        self.status_code = status_code
+        self._json = json_data or {}
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        return self._json
+
+
+def test_sleep_backoff(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("ynab_backup.client.time.sleep", sleeps.append)
+    client = YnabClient("fake-token")
+    client._sleep_backoff(0)
+    assert sleeps[0] == 1
+    client._sleep_backoff(1)
+    assert sleeps[1] == 2
+    client._sleep_backoff(4)
+    assert sleeps[2] == 16
+    client._sleep_backoff(5)
+    assert sleeps[3] == 30
+
+
+def test_request_returns_data(monkeypatch):
+    client = YnabClient("fake-token")
+    monkeypatch.setattr(
+        client.session,
+        "request",
+        lambda *a, **kw: FakeResponse(200, json_data={"data": {"account": {"id": "x"}}}),
+    )
+    data = client.get("/budgets/test-id")
+    assert data == {"account": {"id": "x"}}
+
+
+def test_request_raises_on_404(monkeypatch):
+    client = YnabClient("fake-token")
+    monkeypatch.setattr(
+        client.session,
+        "request",
+        lambda *a, **kw: FakeResponse(404, text="not found"),
+    )
+    with pytest.raises(YnabError, match="not found"):
+        client.get("/budgets/gone")
+
+
+def test_request_raises_on_409(monkeypatch):
+    client = YnabClient("fake-token")
+    monkeypatch.setattr(
+        client.session,
+        "request",
+        lambda *a, **kw: FakeResponse(409, text="conflict"),
+    )
+    with pytest.raises(YnabError, match="conflict"):
+        client.get("/budgets/dup")
+
+
+def test_request_retries_on_500_then_succeeds(monkeypatch):
+    attempts = []
+    client = YnabClient("fake-token")
+    monkeypatch.setattr("ynab_backup.client.time.sleep", lambda d: None)
+
+    def fake_request(*a, **kw):
+        attempts.append(1)
+        if len(attempts) < 3:
+            return FakeResponse(500, text="error")
+        return FakeResponse(200, json_data={"data": {"ok": True}})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    data = client.get("/budgets/test")
+    assert data == {"ok": True}
+    assert len(attempts) == 3  # 2 failures + 1 success
+
+
+def test_request_retries_on_429_with_retry_after(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("ynab_backup.client.time.sleep", sleeps.append)
+    client = YnabClient("fake-token")
+    call_count = [0]
+
+    def fake_request(*a, **kw):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return FakeResponse(429, headers={"Retry-After": "5"})
+        return FakeResponse(200, json_data={"data": {"ok": True}})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    data = client.get("/budgets/test")
+    assert data == {"ok": True}
+    assert call_count[0] == 2
+    # First sleep is Retry-After (5s), not backoff
+    assert sleeps[0] == 5
+
+
+def test_request_max_retries_exceeded(monkeypatch):
+    monkeypatch.setattr("ynab_backup.client.time.sleep", lambda d: None)
+    client = YnabClient("fake-token")
+    monkeypatch.setattr(
+        client.session,
+        "request",
+        lambda *a, **kw: FakeResponse(500, text="error"),
+    )
+    with pytest.raises(YnabError, match="server error"):
+        client.get("/budgets/dead")
+
+
+# --------------------------------------------------------------------------- #
+# Restore: cleanup_default_groups
+# --------------------------------------------------------------------------- #
+
+
+def test_cleanup_default_groups_removes_unmapped():
+    client = FakeClient(
+        resources={
+            "category_groups": [
+                {"id": "g-created", "name": "Needs", "deleted": False},
+                {"id": "g-default", "name": "General", "deleted": False},
+                {"id": "g-internal", "name": "Internal Category Group", "deleted": False},
+                {"id": "g-deleted", "name": "Old", "deleted": True},
+            ],
+        },
+    )
+    restore.cleanup_default_groups(client, "target", group_id_map={"src-id": "g-created"})
+    # Only the unmapped non-internal non-deleted group should be deleted.
+    assert len(client.posts) == 0
+    # FakeClient.delete doesn't track calls, so check via a quick patch.
+    delete_calls = []
+
+    def track_delete(path):
+        delete_calls.append(path)
+        return {}
+
+    client.delete = track_delete
+    restore.cleanup_default_groups(client, "target", group_id_map={"src-id": "g-created"})
+    assert delete_calls == ["/plans/target/category_groups/g-default"]
+
+
+def test_cleanup_default_groups_survives_delete_failure():
+    client = FakeClient(
+        resources={
+            "category_groups": [
+                {"id": "g-created", "name": "Needs", "deleted": False},
+                {"id": "g-default", "name": "General", "deleted": False},
+            ],
+        },
+    )
+
+    def fail_delete(path):
+        raise YnabError("delete not supported")
+
+    client.delete = fail_delete
+    # Should not raise.
+    restore.cleanup_default_groups(client, "target", group_id_map={"src-id": "g-created"})
+
+
+# --------------------------------------------------------------------------- #
+# Backup: backup_once composed test
+# --------------------------------------------------------------------------- #
+
+
+def test_backup_once_composes_full_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr("ynab_backup.backup.prune_snapshots", lambda d, r: None)
+    client = FakeClient(
+        budgets=[{"id": "b1", "name": "My Budget"}],
+        budget={"id": "b1", "name": "My Budget"},
+        resources={
+            "accounts": [{"id": "a1"}],
+            "category_groups": [{"id": "g1", "categories": []}],
+            "payees": [{"id": "p1"}],
+            "months": [{"month": "2024-01-01"}],
+            "transactions": [{"id": "t1"}],
+            "scheduled_transactions": [{"id": "s1"}],
+        },
+    )
+    snap_dir = backup.backup_once(client, "b1", "My Budget", tmp_path, retention=30)
+    assert snap_dir.exists()
+    assert (snap_dir / "accounts.json").exists()
+    assert (snap_dir / "manifest.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Restore: remap_payee / remap_category standalone
+# --------------------------------------------------------------------------- #
+
+
+def test_remap_payee_transfer_wins_over_regular():
+    """Transfer payee map takes precedence even if payee is also in regular map."""
+    result = restore.remap_payee(
+        "p1",
+        payee_id_map={"p1": "regular-new"},
+        transfer_payee_map={"p1": "transfer-new"},
+    )
+    assert result == "transfer-new"
+
+
+def test_remap_payee_none_passthrough():
+    assert restore.remap_payee(None, {}, {}) is None
+
+
+def test_remap_payee_unmapped_returns_none():
+    assert restore.remap_payee("unknown", {}, {}) is None
+
+
+def test_remap_category_none_passthrough():
+    assert restore.remap_category(None, {}) is None
+
+
+def test_remap_category_unmapped_returns_none():
+    assert restore.remap_category("unknown", {}) is None
+
+
+# --------------------------------------------------------------------------- #
+# Budget resolution: fallback path
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_budget_falls_back_when_direct_get_fails():
+    """When the direct budget GET fails, fall back to first budget from list."""
+    class FailGetClient(FakeClient):
+        def get(self, path, **params):
+            if path.startswith("/budgets/") and not path.endswith("/budgets"):
+                raise YnabError("not found")
+            return super().get(path, **params)
+
+    fc = FailGetClient(
+        budgets=[
+            {"id": "b-fallback", "name": "Fallback Budget"},
+            {"id": "b2", "name": "Other"},
+        ],
+        budget={},
+    )
+    bid, bname = backup.resolve_budget(fc, "last-used-budget", None)
+    assert bid == "b-fallback"
+    assert bname == "Fallback Budget"
