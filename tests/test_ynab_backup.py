@@ -299,6 +299,7 @@ def test_create_accounts_includes_debt_and_note():
     assert client.posts[0][0] == "/plans/target/accounts"
     payload = client.posts[0][1]["account"]
     assert payload["note"] == "30-year fixed"
+    assert payload["debt_name"] == "Mortgage"
     assert payload["debt_type"] == "mortgage"
     assert payload["debt_original_balance"] == -50000000
     assert payload["debt_interest_rate"] == 3.5
@@ -391,6 +392,8 @@ def test_create_categories_patches_goals():
     # Should have 1 POST (create category) + 1 PATCH (goals)
     assert len(client.posts) == 1
     assert client.posts[0][0] == "/plans/target/categories"
+    assert client.posts[0][1]["category"]["name"] == "Rent"
+    assert client.posts[0][1]["category"]["category_group_id"] == "g1new"
     assert len(client.patches) == 1
     assert client.patches[0][0].startswith("/plans/target/categories/")
     patch_payload = client.patches[0][1]["category"]
@@ -603,6 +606,10 @@ def test_main_no_subcommand_uses_backup_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("YNAB_ACCESS_TOKEN", "fake-token")
     monkeypatch.setenv("YNAB_BACKUP_DIR", str(tmp_path))
     monkeypatch.setenv("YNAB_BACKUP_INTERVAL_SECONDS", "999")
+    monkeypatch.setenv("YNAB_BUDGET_ID", "last-used-budget")
+    monkeypatch.setenv("YNAB_BACKUP_RETENTION", "30")
+    monkeypatch.delenv("YNAB_BUDGET_NAME", raising=False)
+    monkeypatch.delenv("YNAB_API_BASE_URL", raising=False)
     called_with = {}
 
     def mock_loop(args):
@@ -624,6 +631,10 @@ def test_main_no_subcommand_uses_backup_defaults(monkeypatch, tmp_path):
 def test_main_backup_once(monkeypatch, tmp_path):
     monkeypatch.setenv("YNAB_ACCESS_TOKEN", "fake-token")
     monkeypatch.setenv("YNAB_BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("YNAB_BUDGET_ID", "last-used-budget")
+    monkeypatch.setenv("YNAB_BACKUP_RETENTION", "30")
+    monkeypatch.delenv("YNAB_BUDGET_NAME", raising=False)
+    monkeypatch.delenv("YNAB_API_BASE_URL", raising=False)
     called = {}
 
     def mock_loop(args):
@@ -706,7 +717,7 @@ def test_rate_limiter_report_429():
     clock[0] = 1120.0
     limiter.acquire()  # penalty (t=-2480) ages out, original (t=1000) stays, append → 2.
     # The penalty timestamp (-2480) is not > -2480, so it's pruned.
-    assert len(limiter._timestamps) <= 2
+    assert len(limiter._timestamps) == 2  # original (t=1000) stays + acquire (t=1120)
 
 
 # --------------------------------------------------------------------------- #
@@ -773,20 +784,24 @@ def test_request_raises_on_409(monkeypatch):
 
 
 def test_request_retries_on_500_then_succeeds(monkeypatch):
-    attempts = []
+    sleeps = []
+    monkeypatch.setattr("ynab_backup.client.time.sleep", sleeps.append)
     client = YnabClient("fake-token")
-    monkeypatch.setattr("ynab_backup.client.time.sleep", lambda d: None)
+    call_count = [0]
 
     def fake_request(*a, **kw):
-        attempts.append(1)
-        if len(attempts) < 3:
+        call_count[0] += 1
+        if call_count[0] < 3:
             return FakeResponse(500, text="error")
         return FakeResponse(200, json_data={"data": {"ok": True}})
 
     monkeypatch.setattr(client.session, "request", fake_request)
     data = client.get("/budgets/test")
     assert data == {"ok": True}
-    assert len(attempts) == 3  # 2 failures + 1 success
+    assert call_count[0] == 3  # 2 failures + 1 success
+    # Backoff: attempt 0 (1st retry) → 1s, attempt 1 (2nd retry) → 2s
+    assert sleeps[0] == 1
+    assert sleeps[1] == 2
 
 
 def test_request_retries_on_429_with_retry_after(monkeypatch):
@@ -933,6 +948,7 @@ def test_remap_category_unmapped_returns_none():
 
 def test_resolve_budget_falls_back_when_direct_get_fails():
     """When the direct budget GET fails, fall back to first budget from list."""
+
     class FailGetClient(FakeClient):
         def get(self, path, **params):
             if path.startswith("/budgets/") and not path.endswith("/budgets"):
