@@ -43,9 +43,16 @@ def resolve_budget(
             if b.get("name", "").lower() == budget_name.lower():
                 return b["id"], b["name"]
         raise YnabError(f"no budget named {budget_name!r} found")
-    data = client.get(f"/budgets/{budget_id}")
-    budget = data.get("budget", {})
-    return budget.get("id", budget_id), budget.get("name", "unknown")
+    # Try the given id directly; if it fails (e.g. "last-used-budget" sentinel
+    # with a key that has no usage), fall back to the first budget from the list.
+    try:
+        data = client.get(f"/budgets/{budget_id}")
+        budget = data.get("budget", {})
+        return budget.get("id", budget_id), budget.get("name", "unknown")
+    except YnabError:
+        if budgets:
+            return budgets[0]["id"], budgets[0]["name"]
+        raise
 
 
 def take_snapshot(client: YnabClientProtocol, budget_id: str) -> dict[str, Any]:
