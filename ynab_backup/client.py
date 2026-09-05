@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import requests
@@ -23,21 +24,27 @@ class SlidingWindowRateLimiter:
     down without requiring another 429.
     """
 
-    def __init__(self, max_per_hour: int) -> None:
+    def __init__(
+        self,
+        max_per_hour: int,
+        _get_time: Callable[[], float] | None = None,
+    ) -> None:
         """Initialize the rate limiter.
 
         Args:
             max_per_hour: Maximum requests allowed per rolling hour.
                 Set to 0 or negative to disable limiting.
+            _get_time: Time function for testing (defaults to ``time.time``).
         """
         self.max_per_hour = max_per_hour
         self._timestamps: list[float] = []
+        self._time = _get_time or time.time
 
     def acquire(self) -> None:
         """Block until a request slot is available, then record it."""
         if self.max_per_hour <= 0:
             return
-        now = time.time()
+        now = self._time()
         cutoff = now - 3600
         self._timestamps = [t for t in self._timestamps if t > cutoff]
         while len(self._timestamps) >= self.max_per_hour:
@@ -46,10 +53,10 @@ class SlidingWindowRateLimiter:
                 break
             LOG.warning("rate limit window full; sleeping %.0fs", wait)
             time.sleep(wait)
-            now = time.time()
+            now = self._time()
             cutoff = now - 3600
             self._timestamps = [t for t in self._timestamps if t > cutoff]
-        self._timestamps.append(time.time())
+        self._timestamps.append(self._time())
 
     def report_429(self, retry_after: int | None = None) -> None:
         """Penalize the window after a server-side 429.
@@ -59,7 +66,7 @@ class SlidingWindowRateLimiter:
         for the penalty duration without needing to encounter another 429.
         """
         delay = min(retry_after, 300) if retry_after else 60
-        self._timestamps.append(time.time() - 3600 + delay)
+        self._timestamps.append(self._time() - 3600 + delay)
 
 
 class YnabClientProtocol(Protocol):

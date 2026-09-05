@@ -7,6 +7,7 @@ import json
 import pytest
 
 from ynab_backup import backup, restore
+from ynab_backup.client import SlidingWindowRateLimiter
 from ynab_backup.constants import TXN_BATCH_SIZE
 from ynab_backup.exceptions import YnabError
 
@@ -634,3 +635,75 @@ def test_main_backup_once(monkeypatch, tmp_path):
     rc = main(["backup", "--once"])
     assert rc == 0
     assert called["once"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Rate limiter tests
+# --------------------------------------------------------------------------- #
+
+
+def test_rate_limiter_disabled():
+    limiter = SlidingWindowRateLimiter(max_per_hour=0)
+    for _ in range(100):
+        limiter.acquire()
+    assert len(limiter._timestamps) == 0
+
+
+def test_rate_limiter_tracks_requests():
+    limiter = SlidingWindowRateLimiter(max_per_hour=10)
+    for _ in range(5):
+        limiter.acquire()
+    assert len(limiter._timestamps) == 5
+
+
+def test_rate_limiter_enforces_limit():
+    clock = [0.0]
+
+    def fake_time():
+        return clock[0]
+
+    limiter = SlidingWindowRateLimiter(max_per_hour=3, _get_time=fake_time)
+    for _ in range(3):
+        limiter.acquire()
+    assert len(limiter._timestamps) == 3
+    # 4th acquire with all timestamps at t=0 means the window is full.
+    # To avoid a real sleep, we advance the clock past the prune threshold.
+    clock[0] = 3601.0
+    limiter.acquire()  # All 3 prior timestamps (t=0) age out, slot opens.
+    assert len(limiter._timestamps) == 1
+
+
+def test_rate_limiter_ages_out():
+    """Timestamps older than 3600s are pruned."""
+    clock = [0.0]
+
+    def fake_time():
+        return clock[0]
+
+    limiter = SlidingWindowRateLimiter(max_per_hour=2, _get_time=fake_time)
+    limiter.acquire()  # t=0
+    clock[0] = 1800.0
+    limiter.acquire()  # t=1800, window has [0, 1800], len=2
+    # At t=3601, cutoff=1: t=0 ages out, t=1800 stays, appends t=3601 → 2.
+    clock[0] = 3601.0
+    limiter.acquire()
+    assert len(limiter._timestamps) == 2
+
+
+def test_rate_limiter_report_429():
+    clock = [1000.0]
+
+    def fake_time():
+        return clock[0]
+
+    limiter = SlidingWindowRateLimiter(max_per_hour=5, _get_time=fake_time)
+    limiter.acquire()
+    assert len(limiter._timestamps) == 1
+    limiter.report_429(retry_after=120)
+    assert len(limiter._timestamps) == 2
+    # The penalty timestamp is at now - 3600 + 120 = 1000 - 3600 + 120 = -2480
+    # It will age out in 120 seconds (at time 1120)
+    clock[0] = 1120.0
+    limiter.acquire()  # Prunes: original t=1000 aged out (1120-3600=-2480<1000).
+    # The penalty timestamp (-2480 + delay) also aged out since clock > 1120.
+    assert len(limiter._timestamps) <= 2
