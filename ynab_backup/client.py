@@ -1,4 +1,4 @@
-"""YNAB REST API client with retry, backoff, and throttling."""
+"""YNAB REST API client with retry, backoff, and adaptive rate limiting."""
 
 from __future__ import annotations
 
@@ -12,6 +12,54 @@ from ynab_backup.constants import DEFAULT_API_BASE_URL, DEFAULT_TIMEOUT
 from ynab_backup.exceptions import YnabError
 
 LOG = logging.getLogger("ynab-backup")
+
+
+class SlidingWindowRateLimiter:
+    """Ensures no more than ``max_per_hour`` API requests per rolling hour.
+
+    Before each call, ``acquire()`` checks the sliding window and blocks if
+    the limit would be exceeded.  After a 429 response, ``report_429()``
+    inserts a synthetic timestamp to penalize the window so the rate adjusts
+    down without requiring another 429.
+    """
+
+    def __init__(self, max_per_hour: int) -> None:
+        """Initialize the rate limiter.
+
+        Args:
+            max_per_hour: Maximum requests allowed per rolling hour.
+                Set to 0 or negative to disable limiting.
+        """
+        self.max_per_hour = max_per_hour
+        self._timestamps: list[float] = []
+
+    def acquire(self) -> None:
+        """Block until a request slot is available, then record it."""
+        if self.max_per_hour <= 0:
+            return
+        now = time.time()
+        cutoff = now - 3600
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+        while len(self._timestamps) >= self.max_per_hour:
+            wait = self._timestamps[0] + 3600 - now
+            if wait <= 0:
+                break
+            LOG.warning("rate limit window full; sleeping %.0fs", wait)
+            time.sleep(wait)
+            now = time.time()
+            cutoff = now - 3600
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+        self._timestamps.append(time.time())
+
+    def report_429(self, retry_after: int | None = None) -> None:
+        """Penalize the window after a server-side 429.
+
+        Inserts a synthetic timestamp that ages out in ``retry_after``
+        seconds (or 60 if not provided).  This reduces available quota
+        for the penalty duration without needing to encounter another 429.
+        """
+        delay = min(retry_after, 300) if retry_after else 60
+        self._timestamps.append(time.time() - 3600 + delay)
 
 
 class YnabClientProtocol(Protocol):
@@ -40,14 +88,14 @@ class YnabClientProtocol(Protocol):
 
 
 class YnabClient:
-    """Thin wrapper over the YNAB REST API with retry/backoff and throttling."""
+    """Thin wrapper over the YNAB REST API with retry/backoff and adaptive rate limiting."""
 
     def __init__(
         self,
         token: str,
         base_url: str = DEFAULT_API_BASE_URL,
         timeout: int = DEFAULT_TIMEOUT,
-        throttle_seconds: float = 0,
+        max_requests_per_hour: int = 200,
     ) -> None:
         """Initialize the YNAB API client.
 
@@ -55,7 +103,8 @@ class YnabClient:
             token: YNAB API bearer token.
             base_url: API base URL.
             timeout: Request timeout in seconds.
-            throttle_seconds: Seconds to sleep between API calls.
+            max_requests_per_hour: Maximum API requests per rolling hour.
+                Set to 0 to disable rate limiting.
         """
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
@@ -63,18 +112,15 @@ class YnabClient:
             {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         )
         self.timeout = timeout
-        self.throttle_seconds = throttle_seconds
+        self._rate_limiter = SlidingWindowRateLimiter(max_requests_per_hour)
 
     def _sleep_backoff(self, attempt: int) -> None:
         delay = min(2**attempt, 30)
         LOG.warning("retrying in %ds (attempt %d)", delay, attempt + 1)
         time.sleep(delay)
 
-    def _throttle(self) -> None:
-        if self.throttle_seconds > 0:
-            time.sleep(self.throttle_seconds)
-
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
+        self._rate_limiter.acquire()
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         for attempt in range(4):
             try:
@@ -90,14 +136,14 @@ class YnabClient:
                     raise YnabError(f"server error {resp.status_code} for {url}: {resp.text}")
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            delay = min(int(retry_after), 300)
-                        except ValueError:
-                            delay = 30
-                        LOG.warning("rate limited; waiting %ds (Retry-After)", delay)
-                        time.sleep(delay)
-                        continue
+                    try:
+                        retry_secs = min(int(retry_after), 300) if retry_after else 60
+                    except ValueError:
+                        retry_secs = 30
+                    LOG.warning("rate limited; waiting %ds (Retry-After)", retry_secs)
+                    time.sleep(retry_secs)
+                    self._rate_limiter.report_429(retry_after=retry_secs)
+                    continue
                 self._sleep_backoff(attempt)
                 continue
 
@@ -134,7 +180,6 @@ class YnabClient:
                 data = self._request("GET", next_path)
             else:
                 data = self._request("GET", next_path, params=call_params or None)
-            self._throttle()
             results.extend(data.get(key, []))
             pagination = data.get("pagination")
             next_path = pagination.get("next") if pagination else None
@@ -163,7 +208,6 @@ class YnabClient:
         Returns:
             Response data dict.
         """
-        self._throttle()
         return self._request("POST", path, json=payload)
 
     def patch(self, path: str, payload: dict) -> dict:
@@ -176,7 +220,6 @@ class YnabClient:
         Returns:
             Response data dict.
         """
-        self._throttle()
         return self._request("PATCH", path, json=payload)
 
     def delete(self, path: str) -> dict:
@@ -188,5 +231,4 @@ class YnabClient:
         Returns:
             Response data dict.
         """
-        self._throttle()
         return self._request("DELETE", path)

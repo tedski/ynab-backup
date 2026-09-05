@@ -16,8 +16,8 @@ from ynab_backup.constants import (
     DEFAULT_BACKUP_DIR,
     DEFAULT_BUDGET_ID,
     DEFAULT_INTERVAL,
+    DEFAULT_MAX_RATE,
     DEFAULT_RETENTION,
-    DEFAULT_THROTTLE,
 )
 from ynab_backup.exceptions import YnabError
 from ynab_backup.restore import run_restore
@@ -60,8 +60,8 @@ def client_from_env(args: argparse.Namespace) -> YnabClient:
     base_url = getattr(args, "api_base_url", None) or os.environ.get(
         "YNAB_API_BASE_URL", DEFAULT_API_BASE_URL
     )
-    throttle = getattr(args, "throttle", 0)
-    return YnabClient(token, base_url=base_url, throttle_seconds=throttle)
+    max_rate = getattr(args, "max_rate", DEFAULT_MAX_RATE)
+    return YnabClient(token, base_url=base_url, max_requests_per_hour=max_rate)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         "retention": int(os.environ.get("YNAB_BACKUP_RETENTION", DEFAULT_RETENTION)),
         "token": None,
         "api_base_url": None,
+        "max_rate": DEFAULT_MAX_RATE,
     }
     parser.set_defaults(**backup_defaults)
 
@@ -110,10 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--token", default=None)
     rs.add_argument("--api-base-url", default=None)
     rs.add_argument(
-        "--throttle",
-        type=float,
-        default=DEFAULT_THROTTLE,
-        help=f"seconds to sleep between API calls during restore (default: {DEFAULT_THROTTLE})",
+        "--max-rate",
+        type=int,
+        default=DEFAULT_MAX_RATE,
+        help=f"max API requests per rolling hour (default: {DEFAULT_MAX_RATE}; 0 = no limit)",
     )
     return parser
 

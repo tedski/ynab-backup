@@ -708,8 +708,6 @@ def run_restore(args: argparse.Namespace) -> None:
     )
 
     LOG.info("--- validation report ---")
-    # Validation is read-only; skip throttle to keep it fast.
-    client.throttle_seconds = 0
     for line in validate(client, target_id, snapshot, category_id_map):
         LOG.info("%s", line)
     LOG.info("restore complete: %d transactions, %d scheduled", txns, sched)

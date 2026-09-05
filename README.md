@@ -59,10 +59,11 @@ docker run --rm \
   restore \
   --target-budget-id <new-budget-id> \
   --snapshot /backup/My_Budget/20240115T120000Z \
-  --throttle 2.0
-```
+  --max-rate 200
 
-The `--throttle` flag (default 2.0s) sleeps between API calls to respect YNAB's rate limits. Increase it further if restore continues hitting 429 errors on larger budgets.
+The ``--max-rate`` flag (default 200) controls how many API requests are allowed per rolling hour, matching YNAB's documented rate limit. The rate limiter is adaptive — for small budgets you finish quickly with no blocking; for large budgets requests are spread automatically across the hour window. Set ``--max-rate 0`` to disable rate limiting entirely.
+
+```
 
 The tool replays resources in dependency order, building ID maps as it goes:
 

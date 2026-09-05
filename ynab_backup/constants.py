@@ -6,7 +6,7 @@ DEFAULT_INTERVAL = 21600  # seconds (6 hours)
 DEFAULT_RETENTION = 30
 DEFAULT_BACKUP_DIR = "/backup"
 DEFAULT_TIMEOUT = 60
-DEFAULT_THROTTLE = 0.5  # seconds between API calls during restore
+DEFAULT_MAX_RATE = 200  # requests per rolling hour
 
 INTERNAL_CATEGORY_GROUP = "Internal Category Group"
 
