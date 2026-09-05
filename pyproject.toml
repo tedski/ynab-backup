@@ -1,6 +1,6 @@
 [project]
 name = "ynab-backup"
-version = "1.0.0"
+version = "0.1.0"
 description = "Periodic YNAB budget backup and restore tool"
 requires-python = ">=3.12"
 dependencies = ["requests>=2.32,<3"]
