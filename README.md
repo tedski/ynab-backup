@@ -55,14 +55,14 @@ Each JSON file contains the full, paginated response for that resource. `manifes
 docker run --rm \
   -v /srv/nas/backup/ynab:/backup:ro \
   -e YNAB_ACCESS_TOKEN=<your-token> \
-  ghcr.io/tedski/ynab-backup:1.0.0 \
+  ghcr.io/tedski/ynab-backup:latest \
   restore \
   --target-budget-id <new-budget-id> \
   --snapshot /backup/My_Budget/20240115T120000Z \
-  --throttle 0.5
+  --throttle 2.0
 ```
 
-The `--throttle` flag (default 0.5s) sleeps between API calls to respect YNAB's rate limits. Increase it if restore hits 429 errors on larger budgets.
+The `--throttle` flag (default 2.0s) sleeps between API calls to respect YNAB's rate limits. Increase it further if restore continues hitting 429 errors on larger budgets.
 
 The tool replays resources in dependency order, building ID maps as it goes:
 
