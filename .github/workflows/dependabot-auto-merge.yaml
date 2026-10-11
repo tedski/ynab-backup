@@ -4,7 +4,7 @@
 # Repository settings (already configured):
 #   - Allow auto-merge: enabled (General → Pull Requests).
 #   - Auto-delete head branches: enabled (General → Pull Requests).
-#   - Branch protection on `main` requires the "CI / Lint & Test" status
+#   - Branch protection on `main` requires the "Lint & Test" status
 #     check, with no review requirement (so Dependabot PRs can auto-merge).
 #
 # Security note: uses pull_request_target, so the base-branch workflow runs
