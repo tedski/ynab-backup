@@ -1,0 +1,41 @@
+# Auto-merges low-risk Dependabot pull requests (patch & minor updates) once CI passes.
+# Major (semver-major) updates are left open for manual review.
+#
+# Repository settings (already configured):
+#   - Allow auto-merge: enabled (General → Pull Requests).
+#   - Auto-delete head branches: enabled (General → Pull Requests).
+#   - Branch protection on `main` requires the "CI / Lint & Test" status
+#     check, with no review requirement (so Dependabot PRs can auto-merge).
+#
+# Security note: uses pull_request_target, so the base-branch workflow runs
+# with token access. We never check out PR code, so this is safe.
+name: Dependabot auto-merge
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Auto-merge low-risk updates
+    runs-on: ubuntu-24.04
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Enable auto-merge for patch and minor updates
+        if: >-
+          ${{
+            steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+            steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          }}
+        run: gh pr merge --auto --squash --delete-branch "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
